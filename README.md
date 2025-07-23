@@ -1,4 +1,4 @@
-# 🕸️ Go-P2P: Peer-to-Peer Networking with Bootstrap Server
+# Go-P2P: Peer-to-Peer Networking with Bootstrap Server
 
 This project is a basic implementation of a Peer-to-Peer (P2P) network written in Go, using a central bootstrap server for initial peer discovery and WebSockets for real-time updates.
 
