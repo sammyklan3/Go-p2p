@@ -2,7 +2,7 @@
 
 This project is a basic implementation of a Peer-to-Peer (P2P) network written in Go, using a central bootstrap server for initial peer discovery and WebSockets for real-time updates.
 
-## 🚀 Features
+## Features
 
 - Peer registration via a bootstrap server
 - Real-time peer discovery with WebSockets
@@ -11,7 +11,7 @@ This project is a basic implementation of a Peer-to-Peer (P2P) network written i
 
 ---
 
-## 📦 Project Structure
+## Project Structure
 
 - **Bootstrap Server**: Maintains a list of active peers and provides:
   - `/register` endpoint for new peers to join
@@ -25,7 +25,7 @@ This project is a basic implementation of a Peer-to-Peer (P2P) network written i
 
 ---
 
-## 🔧 Usage
+## Usage
 
 ### Start the P2P node:
 
