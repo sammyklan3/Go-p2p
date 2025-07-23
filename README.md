@@ -8,7 +8,6 @@ This project is a basic implementation of a Peer-to-Peer (P2P) network written i
 - Real-time peer discovery with WebSockets
 - UDP-based peer-to-peer messaging
 - Graceful peer disconnection
-- Optional peer heartbeat monitoring (for peer availability)
 
 ---
 
@@ -32,7 +31,9 @@ This project is a basic implementation of a Peer-to-Peer (P2P) network written i
 
 ```bash
 go run client/p2pclient.go <username> <udp-port> <bootstrap-host:port>
+```
 
-## Example:
+### Example:
 ```bash
 go run main.go alice 10000 localhost:8080
+```
