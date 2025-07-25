@@ -6,65 +6,42 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
+	"math/rand"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"time"
-
-	"github.com/gorilla/websocket"
 )
 
 type Peer struct {
-	Username string `json:"username"`
-	IP       string `json:"ip"`
-	Port     string `json:"port"`
+	Username string    `json:"username"`
+	IP       string    `json:"ip"`
+	Port     string    `json:"port"`
+	LastSeen time.Time `json:"lastSeen"`
 }
 
 var (
-	peerList = make(map[string]Peer)
-	self     Peer
+	peerList   = make(map[string]Peer)
+	peerFile   = "clientPeers.json"
+	self       Peer
+	peerListMu sync.Mutex
 )
 
-// Register this peer with the bootstrap server
 func registerWithServer(serverURL, username, port string) error {
 	localIP := getLocalIP()
 	self = Peer{
 		Username: username,
 		IP:       localIP,
 		Port:     port,
+		LastSeen: time.Now(),
 	}
 	data, _ := json.Marshal(self)
 	_, err := http.Post(serverURL+"/register", "application/json", bytes.NewBuffer(data))
 	return err
 }
 
-// Listen for new peer joins via WebSocket
-func listenToWS(serverURL string) {
-	conn, _, err := websocket.DefaultDialer.Dial("ws://"+serverURL+"/ws", nil)
-	if err != nil {
-		log.Fatal("WebSocket dial error:", err)
-	}
-	defer conn.Close()
-
-	for {
-		_, message, err := conn.ReadMessage()
-		if err != nil {
-			log.Println("WebSocket read error:", err)
-			return
-		}
-		var newPeer Peer
-		json.Unmarshal(message, &newPeer)
-
-		if newPeer.Username == self.Username {
-			continue // ignore self
-		}
-		peerList[newPeer.Username] = newPeer
-		fmt.Printf("[DISCOVERY] New peer joined: %s (%s:%s)\n", newPeer.Username, newPeer.IP, newPeer.Port)
-	}
-}
-
-// Fetch peers from bootstrap on startup
 func getInitialPeers(serverURL string) {
 	resp, err := http.Get(serverURL + "/peers")
 	if err != nil {
@@ -78,79 +55,213 @@ func getInitialPeers(serverURL string) {
 	json.Unmarshal(body, &peers)
 	for _, p := range peers {
 		if p.Username != self.Username {
+			p.LastSeen = time.Now()
+			peerListMu.Lock()
 			peerList[p.Username] = p
-			fmt.Printf("[BOOTSTRAP] Peer: %s (%s:%s)\n", p.Username, p.IP, p.Port)
+			peerListMu.Unlock()
 		}
 	}
+	savePeersToFile()
 }
 
-// Start listening for UDP P2P messages
-func startP2PListener(port string) {
+func startP2PUDPListener(port string) {
 	addr := ":" + port
 	udpAddr, _ := net.ResolveUDPAddr("udp", addr)
 	conn, err := net.ListenUDP("udp", udpAddr)
 	if err != nil {
-		log.Fatalf("Failed to bind to port %s: %v\n", port, err)
+		log.Fatalf("Failed to bind to UDP port %s: %v\n", port, err)
 	}
 	defer conn.Close()
-	fmt.Println("[LISTENING] Waiting for P2P messages on", addr)
+	fmt.Println("[LISTENING] UDP on", addr)
 
-	buf := make([]byte, 1024)
+	buf := make([]byte, 2048)
 	for {
 		n, remoteAddr, err := conn.ReadFromUDP(buf)
 		if err != nil {
-			log.Println("Read error:", err)
+			log.Println("UDP Read error:", err)
 			continue
 		}
-		fmt.Printf("[MESSAGE] Received from %s: %s\n", remoteAddr, string(buf[:n]))
+
+		msg := string(buf[:n])
+		if len(msg) > 8 && msg[:8] == "[GOSSIP]" {
+			handleIncomingGossip(msg[8:])
+		} else {
+			fmt.Printf("[UDP] Received from %s: %s\n", remoteAddr, msg)
+		}
 	}
 }
 
-// Send a message to a specific peer
-func sendMessageToPeer(username, message string) {
-	peer, exists := peerList[username]
-	if !exists {
-		fmt.Println("[ERROR] Peer not found:", username)
+func handleIncomingGossip(data string) {
+	var incoming map[string]Peer
+	err := json.Unmarshal([]byte(data), &incoming)
+	if err != nil {
+		log.Println("[GOSSIP] Decode error:", err)
 		return
 	}
+
+	peerListMu.Lock()
+	defer peerListMu.Unlock()
+
+	for username, peer := range incoming {
+		if username == self.Username {
+			continue
+		}
+		peer.LastSeen = time.Now()
+		if _, exists := peerList[username]; !exists {
+			fmt.Printf("[GOSSIP] New peer: %s (%s:%s)\n", peer.Username, peer.IP, peer.Port)
+		}
+		peerList[username] = peer
+	}
+	savePeersToFile()
+}
+
+func gossipSubsetPeers() {
+	peerListMu.Lock()
+	defer peerListMu.Unlock()
+
+	// Collect peers into slice
+	peers := make([]Peer, 0, len(peerList))
+	for _, p := range peerList {
+		peers = append(peers, p)
+	}
+
+	// Shuffle and pick a subset
+	rand.Shuffle(len(peers), func(i, j int) { peers[i], peers[j] = peers[j], peers[i] })
+	count := 3
+	if len(peers) < count {
+		count = len(peers)
+	}
+	selected := peers[:count]
+
+	// Send gossip to each
+	data, _ := json.Marshal(peerList)
+	for _, peer := range selected {
+		addr := net.JoinHostPort(peer.IP, peer.Port)
+		udpAddr, _ := net.ResolveUDPAddr("udp", addr)
+		conn, err := net.DialUDP("udp", nil, udpAddr)
+		if err != nil {
+			continue
+		}
+		conn.Write([]byte("[GOSSIP]" + string(data)))
+		conn.Close()
+	}
+}
+
+func pruneStalePeers() {
+	ticker := time.NewTicker(1 * time.Minute)
+	for range ticker.C {
+		now := time.Now()
+		peerListMu.Lock()
+		for username, peer := range peerList {
+			if now.Sub(peer.LastSeen) > 2*time.Minute {
+				fmt.Println("[PRUNE] Removing stale peer:", username)
+				delete(peerList, username)
+			}
+		}
+		peerListMu.Unlock()
+		savePeersToFile()
+	}
+}
+
+func sendTCPMessage(username, message string) {
+	peerListMu.Lock()
+	peer, exists := peerList[username]
+	peerListMu.Unlock()
+	if !exists {
+		fmt.Println("[TCP] Peer not found:", username)
+		return
+	}
+
 	addr := net.JoinHostPort(peer.IP, peer.Port)
-	udpAddr, _ := net.ResolveUDPAddr("udp", addr)
-	conn, err := net.DialUDP("udp", nil, udpAddr)
+	conn, err := net.Dial("tcp", addr)
 	if err != nil {
-		log.Printf("[ERROR] Failed to dial %s: %v\n", username, err)
+		log.Println("[TCP] Dial error:", err)
 		return
 	}
 	defer conn.Close()
-
 	conn.Write([]byte(message))
-	fmt.Printf("[SENT] ➡️  Message to %s (%s:%s): %s\n", peer.Username, peer.IP, peer.Port, message)
+	fmt.Printf("[TCP] Sent to %s: %s\n", username, message)
 }
 
-// Send periodic pings to all known peers
-func startPeerInteractionLoop() {
-	ticker := time.NewTicker(10 * time.Second)
-	defer ticker.Stop()
+func startTCPListener(port string) {
+	addr := ":" + port
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		log.Fatalf("TCP Listen error on %s: %v", addr, err)
+	}
+	defer ln.Close()
+	fmt.Println("[LISTENING] TCP on", addr)
 
-	for range ticker.C {
-		for username := range peerList {
-			msg := fmt.Sprintf("PING from %s", self.Username)
-			sendMessageToPeer(username, msg)
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			log.Println("[TCP] Accept error:", err)
+			continue
 		}
+		go func(c net.Conn) {
+			defer c.Close()
+			buf := make([]byte, 2048)
+			n, _ := c.Read(buf)
+			fmt.Printf("[TCP] Received: %s\n", string(buf[:n]))
+		}(conn)
 	}
 }
 
-// Get local machine IP address
 func getLocalIP() string {
 	conn, err := net.Dial("udp", "8.8.8.8:80")
 	if err != nil {
 		return "127.0.0.1"
 	}
 	defer conn.Close()
-	localAddr := conn.LocalAddr().(*net.UDPAddr)
-	return localAddr.IP.String()
+	return conn.LocalAddr().(*net.UDPAddr).IP.String()
 }
 
-// Entry point
+func savePeersToFile() {
+	peerListMu.Lock()
+	defer peerListMu.Unlock()
+
+	data, err := json.MarshalIndent(peerList, "", "  ")
+	if err != nil {
+		log.Println("[SAVE] Marshal error:", err)
+		return
+	}
+	err = os.WriteFile(peerFile, data, 0644)
+	if err != nil {
+		log.Println("[SAVE] Write error:", err)
+	}
+}
+
+func loadPeersFromFile() {
+	data, err := os.ReadFile(peerFile)
+	if err != nil {
+		log.Println("[LOAD] No previous peer file found.")
+		return
+	}
+	var stored map[string]Peer
+	err = json.Unmarshal(data, &stored)
+	if err != nil {
+		log.Println("[LOAD] Decode error:", err)
+		return
+	}
+
+	peerListMu.Lock()
+	for username, peer := range stored {
+		if username != self.Username {
+			peerList[username] = peer
+		}
+	}
+	peerListMu.Unlock()
+}
+
+func startPeerLoop() {
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		gossipSubsetPeers()
+	}
+}
+
 func main() {
 	if len(os.Args) < 4 {
 		fmt.Println("Usage: go run main.go <username> <port> <bootstrap-host:port>")
@@ -158,22 +269,23 @@ func main() {
 	}
 	username := os.Args[1]
 	port := os.Args[2]
-	serverAddr := os.Args[3]
+	bootstrap := os.Args[3]
 
-	err := registerWithServer("http://"+serverAddr, username, port)
+	err := registerWithServer("http://"+bootstrap, username, port)
 	if err != nil {
-		log.Fatalln("Failed to register with bootstrap server:", err)
+		log.Fatalln("Failed to register with bootstrap:", err)
 	}
 
-	getInitialPeers("http://" + serverAddr)
+	loadPeersFromFile()
+	getInitialPeers("http://" + bootstrap)
 
-	go listenToWS(serverAddr)
-	go startP2PListener(port)
-	go startPeerInteractionLoop()
+	go startP2PUDPListener(port)
+	go startTCPListener(port)
+	go startPeerLoop()
+	go pruneStalePeers()
 
-	// Graceful shutdown
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt)
 	<-c
-	fmt.Println("\n[EXIT] Shutting down.")
+	fmt.Println("\n[EXIT] Client shutting down.")
 }
