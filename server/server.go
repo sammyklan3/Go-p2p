@@ -3,24 +3,20 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
+	"p2p-bootstrap-server/p2p"
 	"sync"
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
 )
 
-type Peer struct {
-	Username string `json:"username"`
-	IP       string `json:"ip"`
-	Port     string `json:"port"`
-}
-
 var (
-	peers      = make(map[string]Peer)
+	peers      = make(map[string]p2p.Peer)
 	clients    = make(map[*websocket.Conn]bool)
-	broadcast  = make(chan Peer)
-	mu         sync.Mutex
+	broadcast  = make(chan p2p.Peer)
+	mu         sync.RWMutex
 	wsUpgrader = websocket.Upgrader{
 		CheckOrigin: func(r *http.Request) bool {
 			return true
@@ -29,7 +25,7 @@ var (
 )
 
 func registerPeer(c *gin.Context) {
-	var peer Peer
+	var peer p2p.Peer
 	if err := c.BindJSON(&peer); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid data"})
 		return
@@ -44,10 +40,10 @@ func registerPeer(c *gin.Context) {
 }
 
 func getPeers(c *gin.Context) {
-	mu.Lock()
-	defer mu.Unlock()
+	mu.RLock()
+	defer mu.RUnlock()
 
-	peerList := make([]Peer, 0, len(peers))
+	peerList := make([]p2p.Peer, 0, len(peers))
 	for _, peer := range peers {
 		peerList = append(peerList, peer)
 	}
@@ -76,7 +72,12 @@ func handleWS(c *gin.Context) {
 func startBroadcast() {
 	for {
 		peer := <-broadcast
-		data, _ := json.Marshal(peer)
+		data, err := json.Marshal(peer)
+		if err != nil {
+			log.Printf("Error marshalling peer; %v\n", err)
+			continue
+		}
+
 		for client := range clients {
 			err := client.WriteMessage(websocket.TextMessage, data)
 			if err != nil {

@@ -3,45 +3,56 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"flag"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"log"
 	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"p2p-bootstrap-server/p2p"
+	"strings"
 	"time"
 
 	"github.com/gorilla/websocket"
 )
 
-type Peer struct {
-	Username string `json:"username"`
-	IP       string `json:"ip"`
-	Port     string `json:"port"`
-}
-
 var (
-	peerList = make(map[string]Peer)
-	self     Peer
+	peerList      = make(map[string]p2p.Peer)
+	self          p2p.Peer
+	username      string
+	serverAddress string
 )
 
-// Register this peer with the bootstrap server
-func registerWithServer(serverURL, username, port string) error {
-	localIP := getLocalIP()
-	self = Peer{
-		Username: username,
-		IP:       localIP,
-		Port:     port,
+func init() {
+	flag.StringVar(&username, "username", "", "Username to join the server as")
+	flag.StringVar(&serverAddress, "server", "", "Address of bootstrap server. Format [host:port]")
+	flag.Parse()
+
+	if strings.TrimSpace(username) == "" || strings.TrimSpace(serverAddress) == "" {
+		flag.Usage()
+		os.Exit(1)
 	}
-	data, _ := json.Marshal(self)
-	_, err := http.Post(serverURL+"/register", "application/json", bytes.NewBuffer(data))
-	return err
+
+	err := p2p.ValidateIPAddress(serverAddress)
+	if err != nil {
+		log.Fatalln(err)
+	}
+
+	self = p2p.Peer{
+		Username: username,
+		IP:       p2p.GetLocalIP(),
+		Port:     p2p.GenerateRandomPort(),
+	}
 }
 
 // Listen for new peer joins via WebSocket
-func listenToWS(serverURL string) {
-	conn, _, err := websocket.DefaultDialer.Dial("ws://"+serverURL+"/ws", nil)
+func listenToWS() {
+	endpoint := fmt.Sprintf("ws://%v/ws", serverAddress)
+	log.Printf("Client connecting to %v...\n", endpoint)
+
+	conn, _, err := websocket.DefaultDialer.Dial(endpoint, nil)
 	if err != nil {
 		log.Fatal("WebSocket dial error:", err)
 	}
@@ -53,8 +64,13 @@ func listenToWS(serverURL string) {
 			log.Println("WebSocket read error:", err)
 			return
 		}
-		var newPeer Peer
-		json.Unmarshal(message, &newPeer)
+
+		var newPeer p2p.Peer
+		err = json.Unmarshal(message, &newPeer)
+		if err != nil {
+			log.Printf("Error unmarshalling received message; %v\n", err)
+			continue
+		}
 
 		if newPeer.Username == self.Username {
 			continue // ignore self
@@ -65,16 +81,24 @@ func listenToWS(serverURL string) {
 }
 
 // Fetch peers from bootstrap on startup
-func getInitialPeers(serverURL string) {
-	resp, err := http.Get(serverURL + "/peers")
+func getInitialPeers() {
+	endpoint := fmt.Sprintf("http://%v/peers", serverAddress)
+	log.Printf("Fetching initial peers from %v...\n", endpoint)
+
+	resp, err := http.Get(endpoint)
 	if err != nil {
 		log.Println("Error fetching peers:", err)
 		return
 	}
 	defer resp.Body.Close()
-	body, _ := ioutil.ReadAll(resp.Body)
 
-	var peers []Peer
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		log.Printf("Error reading response body; %v\n", err)
+		return
+	}
+
+	var peers []p2p.Peer
 	json.Unmarshal(body, &peers)
 	for _, p := range peers {
 		if p.Username != self.Username {
@@ -85,12 +109,16 @@ func getInitialPeers(serverURL string) {
 }
 
 // Start listening for UDP P2P messages
-func startP2PListener(port string) {
-	addr := ":" + port
-	udpAddr, _ := net.ResolveUDPAddr("udp", addr)
+func startP2PListener() {
+	addr := fmt.Sprintf(":%v", self.Port)
+	udpAddr, err := net.ResolveUDPAddr("udp", addr)
+	if err != nil {
+		log.Fatalf("[ERROR] Resolving UDP address; %v\n", err)
+	}
+
 	conn, err := net.ListenUDP("udp", udpAddr)
 	if err != nil {
-		log.Fatalf("Failed to bind to port %s: %v\n", port, err)
+		log.Fatalf("[ERROR] Binding to port %s: %v\n", self.Port, err)
 	}
 	defer conn.Close()
 	fmt.Println("[LISTENING] Waiting for P2P messages on", addr)
@@ -113,8 +141,13 @@ func sendMessageToPeer(username, message string) {
 		fmt.Println("[ERROR] Peer not found:", username)
 		return
 	}
+
 	addr := net.JoinHostPort(peer.IP, peer.Port)
-	udpAddr, _ := net.ResolveUDPAddr("udp", addr)
+	udpAddr, err := net.ResolveUDPAddr("udp", addr)
+	if err != nil {
+		log.Fatalf("[ERROR] Resolving UDP address; %v", err)
+	}
+
 	conn, err := net.DialUDP("udp", nil, udpAddr)
 	if err != nil {
 		log.Printf("[ERROR] Failed to dial %s: %v\n", username, err)
@@ -127,7 +160,7 @@ func sendMessageToPeer(username, message string) {
 }
 
 // Send periodic pings to all known peers
-func startPeerInteractionLoop() {
+func pingKnownPeers() {
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 
@@ -139,37 +172,25 @@ func startPeerInteractionLoop() {
 	}
 }
 
-// Get local machine IP address
-func getLocalIP() string {
-	conn, err := net.Dial("udp", "8.8.8.8:80")
-	if err != nil {
-		return "127.0.0.1"
-	}
-	defer conn.Close()
-	localAddr := conn.LocalAddr().(*net.UDPAddr)
-	return localAddr.IP.String()
-}
-
 // Entry point
 func main() {
-	if len(os.Args) < 4 {
-		fmt.Println("Usage: go run main.go <username> <port> <bootstrap-host:port>")
-		return
+	// Register this peer with the bootstrap server
+	data, err := json.Marshal(self)
+	if err != nil {
+		log.Fatalf("Error marshalling peer; %v", err)
 	}
-	username := os.Args[1]
-	port := os.Args[2]
-	serverAddr := os.Args[3]
 
-	err := registerWithServer("http://"+serverAddr, username, port)
+	endpoint := fmt.Sprintf("http://%v/register", serverAddress)
+	_, err = http.Post(endpoint, "application/json", bytes.NewBuffer(data))
 	if err != nil {
 		log.Fatalln("Failed to register with bootstrap server:", err)
 	}
 
-	getInitialPeers("http://" + serverAddr)
+	getInitialPeers()
 
-	go listenToWS(serverAddr)
-	go startP2PListener(port)
-	go startPeerInteractionLoop()
+	go listenToWS()
+	go startP2PListener()
+	go pingKnownPeers()
 
 	// Graceful shutdown
 	c := make(chan os.Signal, 1)
